@@ -9,6 +9,9 @@ import pandas
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import matplotlib.cm as cm
+import scipy.stats
+from matplotlib import colormaps
+import cmasher as cmr
 
 
 class InfectionStatus(Enum):
@@ -151,6 +154,46 @@ class Agent:
         elif next_status == InfectionStatus.SUSCEPTIBLE:
             self.next_status_update = None
 
+
+class Agent:
+
+    def __init__(self, model):
+        self.infection_status = InfectionStatus.SUSCEPTIBLE
+        self.model = model
+        self.next_status_update = None
+
+        self.number_of_times_infected = 0
+        self.last_time_infected = -1
+
+    def update_status(self, t):
+        # Update myself
+        old_status = self.infection_status
+        next_status = InfectionStatus((old_status.value + 1) % len(InfectionStatus))
+        self.infection_status = next_status
+
+        # Update model
+        self.model.persons[old_status].remove_person(self)
+        self.model.persons[next_status].add_person(self)
+
+        # Get next change
+        if next_status == InfectionStatus.INFECTED:
+            delay = sample_discrete(self.model.f_infectious)
+            self.next_status_update = t + delay
+            self.model.transitions[self.next_status_update].append(self)
+
+            self.model.new_infectees[t].append(self)
+            self.number_of_times_infected += 1
+            self.last_time_infected = t
+
+        elif next_status == InfectionStatus.RECOVERED:
+            delay = sample_discrete(self.model.f_recovered)
+            self.next_status_update = t + delay
+            self.model.transitions[self.next_status_update].append(self)
+
+        elif next_status == InfectionStatus.SUSCEPTIBLE:
+            self.next_status_update = None
+
+
 class ModelStep:
     """One step in an agent based model.
 
@@ -230,7 +273,7 @@ class TransmissionStep(ModelStep):
             self.num_infected += num_to_infect
             num_susceptible_this_time_step -= num_to_infect
 
-    
+
 class Test:
     """Imperfect binary testing process
 
@@ -274,7 +317,7 @@ class Test:
                 return False
             else:
                 return True
-            
+
 
 class Observer:
     """Observation process of an epidemic.
@@ -356,7 +399,7 @@ class Model:
         self.N = N
         self.transitions = defaultdict(list)
         self.new_infectees = defaultdict(list)
-        
+
         self.persons = {status: PersonCollection() for status in InfectionStatus}
         self.all_persons = PersonCollection()
 
@@ -412,53 +455,149 @@ class Model:
         return pandas.DataFrame(output)
 
 
+parameters = [
+    [0.35, 5, 3, 10],
+    [0.4, 9, 7, 5],
+]
+
 def transmission_rate(t):
-    if t < 367:
-        return 0.22
+    change_point = 40
+    if t < change_point:
+        return 0.5
+    elif change_point <=  t < 2 * change_point:
+        return 0.5 - 0.0075 * (t - change_point)
+    else:
+        return 0.5 - 0.0075 * change_point
 
-f_mean = 6
-f_var = 1.5 ** 2
-theta = f_var / f_mean
-k = f_mean / theta
-f_dist = scipy.stats.gamma(k, scale=theta)
-f_infectious = f_dist.pdf(np.arange(25))
+all_data = []
+ki = 1
 
-f_mean = 150
-f_var = 75 ** 2
-theta = f_var / f_mean
-k = f_mean / theta
-f_dist = scipy.stats.gamma(k, scale=theta)
-f_recovered = f_dist.pdf(np.arange(2000))
+for params in parameters:
 
-m = Model(100000, 10)
-m.transmission_rate = transmission_rate
+    def transmission_rate(t):
+        return params[0]
+    
+    def transmission_rate(t):
+        change_point = 40
+        if t < change_point:
+            return 0.5
+        elif change_point <=  t < 2 * change_point:
+            return 0.5 - 0.0075 * (t - change_point)
+        else:
+            return 0.5 - 0.0075 * change_point
+ 
+    f_mean = 1000
+    f_var = 100 ** 2
+    theta = f_var / f_mean
+    k = f_mean / theta
+    f_dist = scipy.stats.gamma(k, scale=theta)
+    f_recovered = f_dist.pdf(np.arange(2000))
 
-m.f_infectious = f_infectious
-m.f_recovered = f_recovered
+    f_mean = params[1]
+    f_var = params[2] ** 2
+    theta = f_var / f_mean
+    k = f_mean / theta
+    f_dist = scipy.stats.gamma(k, scale=theta)
+    f_infectious = f_dist.pdf(np.arange(40))
 
-m.add_observers([])
+    ########
+    samples = 10000
+    R = 2
+    gi = []
 
-df = m.simulate(365)
+    for _ in range(samples):
+
+        days = sample_discrete(f_infectious)
+
+        for i in range(days + 1):
+            if i > 0:
+                num_to_infect = scipy.stats.poisson(R).rvs()
+                gi += [i] * num_to_infect
+
+    intrinsic_mean = np.mean(gi)
+    #######
+
+    m = Model(100000, params[3])
+    m.transmission_rate = transmission_rate
+
+    m.f_infectious = f_infectious
+    m.f_recovered = f_recovered
+
+    m.add_observers([])
+
+    df_output = m.simulate(100)
+
+    df = m.output_contact_tracings()
+    df['difference'] = df['date_infectee_infected'] - df['date_infector_infected']
+
+    ts = []
+    means = []
+    data = []
+    ns = []
+    for t in sorted(list(set(df['date_infector_infected']))):
+        ts.append(t)
+        means.append(np.mean(df[df['date_infector_infected'] == t]['difference']))
+        data.append(df[df['date_infector_infected'] == t]['difference'].to_numpy())
+        ns.append(len(df[df['date_infector_infected'] == t]['difference']))
+
+    all_data.append([params[0], f_infectious, df, df_output, ts, means, data, ns, params[3], params[1], params[2], intrinsic_mean])
+
+    df.to_csv('data/epidemic_{}__({}_{}_{}_{}).csv'.format(ki, *params))
+    ki += 1
 
 
-plt.plot(df['transmissions'])
-plt.show()
+cmap = cmr.get_sub_cmap('Blues', 0.2, 1)
 
+fig = plt.figure(figsize=(12, 5))
 
-df = m.output_contact_tracings()
-df = df[df['date_infectee_infected'] < 50]
-df['difference'] = df['date_infectee_infected'] - df['date_infector_infected']
+n_rows = len(all_data)
 
-plt.hist(df['difference'], bins=np.arange(0, 25))
-plt.show()
+ax1 = None
+ax2 = None
+ax3 = None
+ax4 = None
 
-print(np.mean(df['difference']))
+for nr, row in enumerate(all_data):
 
-ts = []
-means = []
-for t in sorted(list(set(df['date_infector_infected']))):
-    ts.append(t)
-    means.append(np.mean(df[df['date_infector_infected'] == t]['difference']))
+    transmission_rate_param, f_infectious, df, df_output, ts, means, data, ns, N, mean, std, gi_mean = row
 
-plt.plot(ts, means)
+    # def transmission_rate(t):
+    #     return transmission_rate_param
+
+    ax1 = fig.add_subplot(n_rows, 4, 4 * nr + 1, sharey=ax1)
+    ax1.bar(np.arange(len(f_infectious)), f_infectious, label=r'$f^\text{ infectious}$' + '\n(mean={},\nstdev={})'.format(mean, std), color='k')
+
+    ax1.legend()
+    ax1.set_xlabel('Time since infection (Days)')
+    ax1.set_ylabel('Probability')
+
+    ax2 = fig.add_subplot(n_rows, 4, 4 * nr + 2, sharey=ax2)
+    tis = df_output['time']
+    ax2.plot(tis, [transmission_rate(t) for t in tis], label=r'$\rho(t);$' + '\n' + r'($I(t=0)={}$)'.format(N), color='k')
+
+    ax2.legend()
+    ax2.set_xlabel('Simulation time (Days)')
+    ax2.set_ylabel('Transmission rate')
+
+    ax3 = fig.add_subplot(n_rows, 4, 4 * nr + 3, sharey=ax3)
+    ax3.plot(df_output['time'], df_output['transmissions'], color='tab:blue')
+    # ax3.plot(df_output['time'], df_output[InfectionStatus.SUSCEPTIBLE], color='tab:red')
+    ax3.set_xlabel('Simulation time (Days)')
+    ax3.set_ylabel('New infections')
+
+    ax4 = fig.add_subplot(n_rows, 4, 4 * nr + 4, sharex=ax4)
+
+    ax4.scatter(ts, means, c=[cmap(n/max(ns)) for n in ns], s=3)
+    ax4.axhline(gi_mean, color="tab:green")
+    bar = mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=min(ns), vmax=max(ns), clip=True), cmap=cmap,)
+    cax = fig.colorbar(bar, ax=ax4, orientation='vertical', label='Number of pairs')
+    cax.set_ticks([min(ns), max(ns)])
+
+    ax4.set_xlabel("Infector's day of onset")
+    ax4.set_ylabel('Mean duration between\ninfection onsets (days)')
+
+    # ax4.set_ylim(0, 6)
+
+fig.set_tight_layout(True)
+plt.savefig('Figure1.png')
 plt.show()
